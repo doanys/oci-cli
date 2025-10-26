@@ -1,0 +1,225 @@
+name: Create OCI ARM Instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_name:
+        description: 'Instance name'
+        required: true
+        default: 'github-arm-instance'
+      ocpu_count:
+        description: 'Number of OCPUs'
+        required: true
+        default: '4'
+      memory_gb:
+        description: 'Memory in GB'
+        required: true
+        default: '24'
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Install OCI CLI
+      run: |
+        bash -c "$(curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh)"
+        oci --version
+    
+    - name: Configure OCI CLI
+      env:
+        OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+        OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+        OCI_REGION: ${{ secrets.OCI_REGION }}
+        OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+        OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      run: |
+        # 创建 .oci 目录
+        mkdir -p ~/.oci
+        chmod 700 ~/.oci
+        
+        # 写入私钥
+        echo "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+        chmod 600 ~/.oci/oci_api_key.pem
+        
+        # 配置 OCI CLI
+        oci setup config \
+          --user-ocid "$OCI_USER_OCID" \
+          --tenant-ocid "$OCI_TENANCY_OCID" \
+          --fingerprint "$OCI_FINGERPRINT" \
+          --region "$OCI_REGION" \
+          --file ~/.oci/config
+        
+        # 验证配置
+        echo "✅ OCI CLI configured successfully"
+    
+    - name: Test authentication
+      run: |
+        echo "🔐 Testing OCI authentication..."
+        oci iam user get --user-id ${{ secrets.OCI_USER_OCID }}
+        echo "✅ Authentication successful!"
+    
+    - name: Get compartment OCID
+      id: get-compartment
+      run: |
+        COMPARTMENT_OCID=$(oci iam compartment list \
+          --compartment-id ${{ secrets.OCI_TENANCY_OCID }} \
+          --query "data[?name=='$(echo Root)'].id | [0]" \
+          --raw-output)
+        
+        if [ -z "$COMPARTMENT_OCID" ]; then
+          COMPARTMENT_OCID=${{ secrets.OCI_TENANCY_OCID }}
+        fi
+        
+        echo "compartment-ocid=$COMPARTMENT_OCID" >> $GITHUB_OUTPUT
+        echo "📍 Using compartment: $COMPARTMENT_OCID"
+    
+    - name: Get availability domain
+      id: get-ad
+      run: |
+        AD_NAME=$(oci iam availability-domain list \
+          --compartment-id ${{ steps.get-compartment.outputs.compartment-ocid }} \
+          --query "data[0].name" \
+          --raw-output)
+        
+        echo "availability-domain=$AD_NAME" >> $GITHUB_OUTPUT
+        echo "📍 Using availability domain: $AD_NAME"
+    
+    - name: Get VCN and Subnet (optional, create if not exists)
+      id: get-network
+      run: |
+        # 检查是否存在 VCN
+        VCN_LIST=$(oci network vcn list \
+          --compartment-id ${{ steps.get-compartment.outputs.compartment-ocid }} \
+          --query "data[0]" --raw-output)
+        
+        if [ "$VCN_LIST" == "null" ] || [ -z "$VCN_LIST" ]; then
+          echo "VCN not found, you need to create one in OCI console first"
+          echo "vcn-id=" >> $GITHUB_OUTPUT
+          echo "subnet-id=" >> $GITHUB_OUTPUT
+        else
+          VCN_ID=$(echo $VCN_LIST | jq -r '.id')
+          SUBNET_ID=$(oci network subnet list \
+            --compartment-id ${{ steps.get-compartment.outputs.compartment-ocid }} \
+            --vcn-id $VCN_ID \
+            --query "data[0].id" --raw-output)
+          
+          echo "vcn-id=$VCN_ID" >> $GITHUB_OUTPUT
+          echo "subnet-id=$SUBNET_ID" >> $GITHUB_OUTPUT
+          echo "✅ Found VCN: $VCN_ID"
+        fi
+    
+    - name: Get Oracle Linux ARM image
+      id: get-image
+      run: |
+        IMAGE_ID=$(oci compute image list \
+          --compartment-id ${{ steps.get-compartment.outputs.compartment-ocid }} \
+          --operating-system "Oracle Linux" \
+          --operating-system-version "8" \
+          --shape "VM.Standard.A1.Flex" \
+          --lifecycle-state "AVAILABLE" \
+          --query "data[0].id" \
+          --raw-output)
+        
+        if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" == "null" ]; then
+          echo "❌ ARM-compatible image not found"
+          echo "You need to create a custom image or use marketplace image"
+          exit 1
+        fi
+        
+        echo "image-id=$IMAGE_ID" >> $GITHUB_OUTPUT
+        echo "✅ Found ARM image: $IMAGE_ID"
+    
+    - name: Create SSH key pair
+      id: ssh-key
+      run: |
+        # 生成 SSH 密钥对
+        ssh-keygen -t rsa -b 4096 -f ~/.ssh/oci_key -N "" -q
+        cat ~/.ssh/oci_key.pub
+        
+        # 将私钥和公钥保存到变量
+        PRIVATE_KEY=$(cat ~/.ssh/oci_key)
+        PUBLIC_KEY=$(cat ~/.ssh/oci_key.pub)
+        
+        # 使用 base64 编码（GitHub Actions 多行处理）
+        echo "private-key<<EOF" >> $GITHUB_OUTPUT
+        echo "$PRIVATE_KEY" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+        echo "public-key=$PUBLIC_KEY" >> $GITHUB_OUTPUT
+    
+    - name: Create ARM compute instance
+      if: steps.get-network.outputs.subnet-id != ''
+      run: |
+        echo "🚀 Creating ARM instance: ${{ github.event.inputs.instance_name }}"
+        
+        oci compute instance launch \
+          --display-name "${{ github.event.inputs.instance_name }}" \
+          --availability-domain "${{ steps.get-ad.outputs.availability-domain }}" \
+          --compartment-id "${{ steps.get-compartment.outputs.compartment-ocid }}" \
+          --image-id "${{ steps.get-image.outputs.image-id }}" \
+          --shape "VM.Standard.A1.Flex" \
+          --shape-config '{"ocpus":'${{ github.event.inputs.ocpu_count }}',"memoryInGBs":'${{ github.event.inputs.memory_gb }}'}' \
+          --subnet-id "${{ steps.get-network.outputs.subnet-id }}" \
+          --assign-public-ip true \
+          --metadata '{"ssh_authorized_keys":"${{ steps.ssh-key.outputs.public-key }}"}'
+        
+        echo "✅ Instance created successfully!"
+    
+    - name: Get instance details
+      run: |
+        INSTANCE_ID=$(oci compute instance list \
+          --compartment-id ${{ steps.get-compartment.outputs.compartment-ocid }} \
+          --display-name "${{ github.event.inputs.instance_name }}" \
+          --lifecycle-state "PROVISIONING" \
+          --query "data[0].id" \
+          --raw-output)
+        
+        if [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != "null" ]; then
+          echo "Instance ID: $INSTANCE_ID"
+          
+          # 等待实例运行
+          echo "⏳ Waiting for instance to be running..."
+          oci compute instance wait \
+            --instance-id "$INSTANCE_ID" \
+            --wait-for-state "RUNNING"
+          
+          # 获取实例 IP
+          PUBLIC_IP=$(oci compute instance get \
+            --instance-id "$INSTANCE_ID" \
+            --query 'data."display-name"' \
+            --raw-output)
+          
+          echo "✅ Instance is running!"
+          echo "📧 SSH connection info saved as artifact"
+        fi
+    
+    - name: Upload SSH key
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ssh-key
+        path: ~/.ssh/oci_key
+        retention-days: 7
+    
+    - name: Display connection info
+      run: |
+        echo "🎉 Instance created successfully!"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Instance Name: ${{ github.event.inputs.instance_name }}"
+        echo "OCPUs: ${{ github.event.inputs.ocpu_count }}"
+        echo "Memory: ${{ github.event.inputs.memory_gb }} GB"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        echo "To connect to your instance:"
+        echo "1. Download the SSH key from artifacts"
+        echo "2. Use the IP address from OCI console"
+        echo "3. SSH: ssh -i oci_key opc@<instance-ip>"
+        echo ""
+        echo "⚠️  Save the SSH key from artifacts!"
+
